@@ -400,14 +400,15 @@ class TocTree(QTreeWidget):
         # Collect selected items, then remove only those that aren't already
         # descendants of another selected item (removing a parent takes its
         # subtree with it, so removing the child separately would crash).
-        selected = set(self.selectedItems())
+        selected = self.selectedItems()
         if not selected:
             return
+        selected_ids = {id(it) for it in selected}
 
         def has_selected_ancestor(item):
             p = item.parent()
             while p:
-                if p in selected:
+                if id(p) in selected_ids:
                     return True
                 p = p.parent()
             return False
@@ -422,11 +423,11 @@ class TocTree(QTreeWidget):
 
     def _items_in_tree_order(self, items):
         '''Return items sorted by DFS pre-order position in the tree.'''
-        item_set = set(items)
+        item_ids = {id(it) for it in items}
         result = []
 
         def walk(item):
-            if item in item_set:
+            if id(item) in item_ids:
                 result.append(item)
             for i in range(item.childCount()):
                 walk(item.child(i))

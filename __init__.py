@@ -18,4 +18,11 @@ class EmbedToc(InterfaceActionBase):
     actual_plugin = 'calibre_plugins.toc_bookmarker.ui:EmbedTocAction'
 
     def is_customizable(self):
-        return False
+        return True
+
+    def config_widget(self):
+        from calibre_plugins.toc_bookmarker.config import ConfigWidget
+        return ConfigWidget()
+
+    def save_settings(self, config_widget):
+        config_widget.commit()

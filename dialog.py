@@ -342,7 +342,7 @@ class TocTree(QTreeWidget):
         self.setHeaderLabels(['Title', 'Page'])
         self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
-        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setDropIndicatorShown(True)
         self.setRootIsDecorated(True)
         header = self.header()
@@ -397,14 +397,28 @@ class TocTree(QTreeWidget):
         self.editItem(item, self.COL_TITLE)
 
     def delete_selected(self):
-        item = self.currentItem()
-        if not item:
+        # Collect selected items, then remove only those that aren't already
+        # descendants of another selected item (removing a parent takes its
+        # subtree with it, so removing the child separately would crash).
+        selected = set(self.selectedItems())
+        if not selected:
             return
-        parent = item.parent()
-        if parent:
-            parent.removeChild(item)
-        else:
-            self.takeTopLevelItem(self.indexOfTopLevelItem(item))
+
+        def has_selected_ancestor(item):
+            p = item.parent()
+            while p:
+                if p in selected:
+                    return True
+                p = p.parent()
+            return False
+
+        roots = [it for it in selected if not has_selected_ancestor(it)]
+        for item in roots:
+            parent = item.parent()
+            if parent:
+                parent.removeChild(item)
+            else:
+                self.takeTopLevelItem(self.indexOfTopLevelItem(item))
 
     def indent_selected(self):
         '''Make the selected item a child of its preceding sibling.'''

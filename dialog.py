@@ -31,12 +31,14 @@ from calibre_plugins.toc_bookmarker.bookmarker.common import (
     all_pages_numeric, parse_toc, serialize_toc,
 )
 from calibre_plugins.toc_bookmarker.bookmarker.pdf import (
-    BookmarkError, MissingPageLabel, write_bookmarks,
+    BookmarkError, MissingPageLabel, check_pdf_health, write_bookmarks,
 )
+from calibre_plugins.toc_bookmarker.config import prefs
 
 
 TOC_FILENAME = 'toc'
 ORIGINAL_BACKUP_SUFFIX = '.original_pdf'
+DIRTY_BACKUP_SUFFIX = '.dirty_pdf'
 
 PLACEHOLDER = (
     "# Example TOC. Indentation defines nesting; the last token on each line\n"
@@ -323,6 +325,94 @@ class TocTable(QTableWidget):
         return out
 
 
+# ---------- PDF health-check dialog ----------
+
+class _PdfHealthDialog(QDialog):
+    '''
+    Shown before writing bookmarks when issues are detected:
+      - PDF already has an outline (will be overwritten).
+      - PDF has corrupt cross-reference entries (pypdf warnings).
+
+    Possible outcomes (self.action):
+      'cancel'   – user cancelled; abort the apply.
+      'continue' – user wants to proceed despite issues.
+      'fix'      – user wants to run Ghostscript first, then apply.
+    '''
+
+    def __init__(self, parent, has_toc, corrupt_count, gs_path):
+        super().__init__(parent)
+        self.action = 'cancel'
+        self.setWindowTitle('PDF Health Check')
+        self.setMinimumWidth(520)
+
+        layout = QVBoxLayout(self)
+
+        # ---- Issue list ----
+        if has_toc:
+            toc_label = QLabel(
+                '<b>⚠ This PDF already has a table of contents.</b><br>'
+                'Applying will overwrite the existing outline.'
+            )
+            toc_label.setWordWrap(True)
+            layout.addWidget(toc_label)
+
+        if corrupt_count:
+            corrupt_label = QLabel(
+                f'<b>⚠ {corrupt_count} corrupt object reference(s) detected.</b><br>'
+                'Some PDF readers (e.g. KOReader) may not display the TOC correctly '
+                'on a file with this many internal errors. It is recommended to clean '
+                'the PDF with Ghostscript before embedding a TOC.'
+            )
+            corrupt_label.setWordWrap(True)
+            layout.addWidget(corrupt_label)
+
+            # GS fix section
+            gs_note = QLabel(
+                'Ghostscript will rewrite the PDF to a clean copy. '
+                'The current file will be moved to the book\'s data folder '
+                f'as <tt>{DIRTY_BACKUP_SUFFIX}</tt>.'
+            )
+            gs_note.setWordWrap(True)
+            layout.addWidget(gs_note)
+
+        layout.addSpacing(8)
+
+        # ---- Buttons ----
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch(1)
+
+        if corrupt_count:
+            gs_available = bool(gs_path and shutil.which(gs_path))
+            self._fix_btn = QPushButton('Fix with Ghostscript && Continue')
+            self._fix_btn.setEnabled(gs_available)
+            if not gs_available:
+                self._fix_btn.setToolTip(
+                    f'Ghostscript not found at {gs_path!r}. '
+                    'Set the path in Preferences → Plugins → Embed ToC → Customize.'
+                )
+            self._fix_btn.clicked.connect(self._on_fix)
+            btn_layout.addWidget(self._fix_btn)
+
+        continue_btn = QPushButton('Continue Anyway')
+        continue_btn.clicked.connect(self._on_continue)
+        btn_layout.addWidget(continue_btn)
+
+        cancel_btn = QPushButton('Cancel')
+        cancel_btn.setDefault(True)
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        layout.addLayout(btn_layout)
+
+    def _on_fix(self):
+        self.action = 'fix'
+        self.accept()
+
+    def _on_continue(self):
+        self.action = 'continue'
+        self.accept()
+
+
 # ---------- Main dialog ----------
 
 class EmbedTocDialog(QDialog):
@@ -342,8 +432,11 @@ class EmbedTocDialog(QDialog):
         # '.original_pdf' (extensionless). Only ever written once.
         pdf_basename = os.path.basename(pdf_path)
         pdf_stem, _ = os.path.splitext(pdf_basename)
+        self.pdf_stem = pdf_stem
         self.backup_path = os.path.join(
             self.data_folder, pdf_stem + ORIGINAL_BACKUP_SUFFIX)
+        self.dirty_path = os.path.join(
+            self.data_folder, pdf_stem + DIRTY_BACKUP_SUFFIX)
         self.book_title = book_title
 
         # Track which tab the user is leaving so we know which side to parse.
@@ -604,6 +697,83 @@ class EmbedTocDialog(QDialog):
         except TocParseError as e:
             self._show_parse_error(e)
 
+    # ---- PDF health check / GS fix ----
+
+    def _check_pdf_and_maybe_fix(self):
+        '''
+        Run a health check on the PDF and, if issues are found, show
+        _PdfHealthDialog. Returns True if the apply should proceed
+        (possibly after a GS fix), False if the user cancelled.
+        '''
+        try:
+            health = check_pdf_health(self.pdf_path)
+        except Exception:
+            # If we can't even read the file, let _on_apply surface the error.
+            return True
+
+        if not health['has_toc'] and not health['corrupt_count']:
+            return True
+
+        dlg = _PdfHealthDialog(
+            self,
+            has_toc=health['has_toc'],
+            corrupt_count=health['corrupt_count'],
+            gs_path=prefs['gs_path'],
+        )
+        dlg.exec()
+
+        if dlg.action == 'cancel':
+            return False
+        if dlg.action == 'fix':
+            return self._run_gs_fix()
+        return True  # 'continue'
+
+    def _run_gs_fix(self):
+        '''
+        Run Ghostscript to rewrite self.pdf_path as a clean copy.
+        The original is moved to self.dirty_path first; on failure it is
+        restored and an error dialog is shown.
+        Returns True on success, False on failure.
+        '''
+        gs_path = prefs['gs_path']
+        if os.path.exists(self.dirty_path):
+            if not question_dialog(
+                    self, 'Dirty backup already exists',
+                    f'A previous dirty backup already exists at\n\n{self.dirty_path}\n\n'
+                    'Overwrite it with the current PDF?'):
+                return False
+            try:
+                os.remove(self.dirty_path)
+            except OSError as e:
+                return not error_dialog(self, "Couldn't remove old dirty backup",
+                                        str(e), show=True)
+
+        try:
+            shutil.move(self.pdf_path, self.dirty_path)
+        except OSError as e:
+            return not error_dialog(self, "Couldn't move PDF for GS fix",
+                                    str(e), show=True)
+
+        try:
+            result = subprocess.run(
+                [gs_path, '-dBATCH', '-dNOPAUSE', '-sDEVICE=pdfwrite',
+                 f'-sOutputFile={self.pdf_path}', self.dirty_path],
+                capture_output=True, text=True,
+            )
+        except OSError as e:
+            shutil.move(self.dirty_path, self.pdf_path)
+            return not error_dialog(
+                self, "Couldn't launch Ghostscript",
+                f'Command: {gs_path}\n\n{e}', show=True)
+
+        if result.returncode != 0:
+            shutil.move(self.dirty_path, self.pdf_path)
+            return not error_dialog(
+                self, 'Ghostscript failed',
+                result.stderr or result.stdout or '(no output)', show=True)
+
+        return True
+
     # ---- Apply / write ----
 
     def _on_apply(self):
@@ -617,6 +787,9 @@ class EmbedTocDialog(QDialog):
                 self, 'Nothing to write',
                 'The TOC is empty. Add at least one entry, then try again.',
                 show=True)
+
+        if not self._check_pdf_and_maybe_fix():
+            return
 
         apply_offset = all_pages_numeric(toc) and toc.offset != 0
 

@@ -6,6 +6,7 @@ page-number confusion that plagues PDF bookmark tools.
 Returns nothing on success; raises on failure.
 '''
 
+import logging
 import os
 import tempfile
 
@@ -17,6 +18,34 @@ except ImportError:
     from pypdf import PdfReader, PdfWriter
 
 from calibre_plugins.toc_bookmarker.bookmarker.common import effective_page
+
+
+class _CorruptCounter(logging.Handler):
+    '''Counts "Ignoring wrong pointing object" log records from pypdf.'''
+    def __init__(self):
+        super().__init__()
+        self.count = 0
+
+    def emit(self, record):
+        if 'wrong pointing object' in record.getMessage().lower():
+            self.count += 1
+
+
+def check_pdf_health(pdf_path):
+    '''
+    Open the PDF and return a dict:
+      has_toc:       bool – PDF already has an outline
+      corrupt_count: int  – number of corrupt cross-reference warnings
+    '''
+    counter = _CorruptCounter()
+    pypdf_log = logging.getLogger('pypdf._reader')
+    pypdf_log.addHandler(counter)
+    try:
+        reader = PdfReader(pdf_path)
+        has_toc = bool(reader.outline)
+    finally:
+        pypdf_log.removeHandler(counter)
+    return {'has_toc': has_toc, 'corrupt_count': counter.count}
 
 
 class BookmarkError(Exception):

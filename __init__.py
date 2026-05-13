@@ -11,11 +11,18 @@ class EmbedToc(InterfaceActionBase):
                                'books in your library from a plain-text TOC.')
     supported_platforms     = ['windows', 'osx', 'linux']
     author                  = 'Rex'
-    version                 = (0, 2, 0)
+    version                 = (0, 3, 0)
     minimum_calibre_version = (5, 0, 0)
 
     # module_path:class_name; loaded only in a GUI context.
     actual_plugin = 'calibre_plugins.toc_bookmarker.ui:EmbedTocAction'
 
     def is_customizable(self):
-        return False
+        return True
+
+    def config_widget(self):
+        from calibre_plugins.toc_bookmarker.config import ConfigWidget
+        return ConfigWidget()
+
+    def save_settings(self, config_widget):
+        config_widget.commit()

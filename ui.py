@@ -30,10 +30,6 @@ class EmbedTocAction(InterfaceAction):
     # Don't place automatically; the user picks where it goes.
     auto_repeat = False
 
-    def initialization_complete(self):
-        self.gui.library_view.context_menu.addSeparator()
-        self.gui.library_view.context_menu.addAction(self.qaction)
-
     def genesis(self):
         # Try to load a custom icon; fall back to a builtin so the action
         # is never icon-less.

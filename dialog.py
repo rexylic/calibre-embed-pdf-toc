@@ -653,8 +653,18 @@ class EmbedTocDialog(QDialog):
         ]
 
     def done(self, result):
+        self._autosave_toc()
         self._save_geometry()
         super().done(result)
+
+    def _autosave_toc(self):
+        '''Persist the current TOC to disk on any close path (including Cancel).
+        Silently skips if the editor content can't be parsed.'''
+        try:
+            toc = self._current_toc()
+            self._save_toc_file(toc)
+        except (TocParseError, OSError):
+            pass
 
     # ---- UI construction ----
 

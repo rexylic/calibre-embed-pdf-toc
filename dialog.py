@@ -691,6 +691,9 @@ class EmbedTocDialog(QDialog):
     # ---- Clean PDF ----
 
     def _on_clean_pdf(self):
+        if not shutil.which(prefs['gs_path']):
+            self._open_prefs_dialog()
+            return
         if not question_dialog(
                 self, 'Clean PDF with Ghostscript?',
                 'This will rewrite the PDF using Ghostscript to fix corrupt internal '
@@ -703,6 +706,24 @@ class EmbedTocDialog(QDialog):
                 self, 'PDF cleaned',
                 'The PDF was successfully rewritten by Ghostscript.',
                 show=True)
+
+    def _open_prefs_dialog(self):
+        '''Open an inline preferences dialog for the plugin so the user can
+        set the Ghostscript path without leaving the embed dialog.'''
+        from calibre_plugins.toc_bookmarker.config import ConfigWidget
+        cw = ConfigWidget()
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Embed PDF ToC — Preferences')
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(cw)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            cw.commit()
 
     # ---- Load from external file ----
 

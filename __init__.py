@@ -11,7 +11,7 @@ class EmbedToc(InterfaceActionBase):
                                'books in your library from a plain-text TOC.')
     supported_platforms     = ['windows', 'osx', 'linux']
     author                  = 'Rex'
-    version                 = (0, 3, 0)
+    version                 = (0, 3, 1)
     minimum_calibre_version = (5, 0, 0)
 
     # module_path:class_name; loaded only in a GUI context.

@@ -515,6 +515,15 @@ class EmbedTocDialog(QDialog):
         self.load_btn = QPushButton('Load from file…')
         self.load_btn.clicked.connect(self._on_load_from_file)
         bottom.addWidget(self.load_btn)
+
+        self.clean_btn = QPushButton('Clean PDF')
+        self.clean_btn.setToolTip(
+            'Rewrite the PDF using Ghostscript to fix corrupt internal references.\n'
+            'This may resolve issues where the table of contents appears correctly\n'
+            'on desktop but is missing on e-reader devices (e.g. KOReader).'
+        )
+        self.clean_btn.clicked.connect(self._on_clean_pdf)
+        bottom.addWidget(self.clean_btn)
         bottom.addStretch(1)
 
         self.button_box = QDialogButtonBox(
@@ -678,6 +687,22 @@ class EmbedTocDialog(QDialog):
             self.offset_spin.setEnabled(False)
             self.offset_note.setText(
                 '(disabled: non-numeric page labels present)')
+
+    # ---- Clean PDF ----
+
+    def _on_clean_pdf(self):
+        if not question_dialog(
+                self, 'Clean PDF with Ghostscript?',
+                'This will rewrite the PDF using Ghostscript to fix corrupt internal '
+                'references. The current file will be moved to the book\'s data folder '
+                f'as <tt>{DIRTY_BACKUP_SUFFIX}</tt>.<br><br>'
+                'Continue?'):
+            return
+        if self._run_gs_fix():
+            info_dialog(
+                self, 'PDF cleaned',
+                'The PDF was successfully rewritten by Ghostscript.',
+                show=True)
 
     # ---- Load from external file ----
 

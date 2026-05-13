@@ -1,0 +1,58 @@
+name: Build and Release Plugin
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+
+      - name: Verify version matches __init__.py
+        run: |
+          DECLARED=$(python3 -c "
+          import re, pathlib
+          src = pathlib.Path('__init__.py').read_text()
+          m = re.search(r'version\s*=\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)', src)
+          print('.'.join(m.groups()))
+          ")
+          if [ "$DECLARED" != "$VERSION" ]; then
+            echo "Tag version ($VERSION) does not match __init__.py ($DECLARED)"
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Vendor pypdf
+        run: |
+          pip install -r requirements-vendor.txt --target=. --no-deps
+          rm -rf pypdf-*.dist-info *.dist-info
+
+      - name: Build plugin ZIP
+        run: |
+          ZIP_NAME="embed-toc-v${VERSION}.zip"
+          zip -r "$ZIP_NAME" . \
+            -x '.git/*' '.github/*' '__pycache__/*' '*/__pycache__/*' \
+               '*.pyc' 'test_plugin.py' '.gitignore' '*.zip' \
+               'requirements-vendor.txt' 'LICENSE'
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Embed ToC v${{ env.VERSION }}
+          files: ${{ env.ZIP_NAME }}
+          generate_release_notes: true

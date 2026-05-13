@@ -469,9 +469,9 @@ class EmbedTocDialog(QDialog):
             self.table.columnWidth(col) for col in range(3)
         ]
 
-    def closeEvent(self, event):
+    def done(self, result):
         self._save_geometry()
-        super().closeEvent(event)
+        super().done(result)
 
     # ---- UI construction ----
 

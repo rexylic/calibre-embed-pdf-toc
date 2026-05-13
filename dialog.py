@@ -21,9 +21,9 @@ import sys
 
 from qt.core import (
     QAbstractItemView, QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
-    QHBoxLayout, QHeaderView, QIcon, QLabel, QMessageBox, QPlainTextEdit,
-    QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, Qt,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QHeaderView, QIcon, QLabel, QMessageBox,
+    QPlainTextEdit, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
+    QTabWidget, Qt, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from calibre.gui2 import error_dialog, gprefs, info_dialog, question_dialog
@@ -420,11 +420,30 @@ class TocTree(QTreeWidget):
             else:
                 self.takeTopLevelItem(self.indexOfTopLevelItem(item))
 
+    def _items_in_tree_order(self, items):
+        '''Return items sorted by DFS pre-order position in the tree.'''
+        item_set = set(items)
+        result = []
+
+        def walk(item):
+            if item in item_set:
+                result.append(item)
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+        for i in range(self.topLevelItemCount()):
+            walk(self.topLevelItem(i))
+        return result
+
     def indent_selected(self):
-        '''Make the selected item a child of its preceding sibling.'''
-        item = self.currentItem()
-        if not item:
-            return
+        '''Make each selected item a child of its preceding sibling.'''
+        items = self._items_in_tree_order(self.selectedItems())
+        for item in items:
+            self._indent_item(item)
+        for item in items:
+            item.setSelected(True)
+
+    def _indent_item(self, item):
         parent = item.parent()
         if parent:
             idx = parent.indexOfChild(item)
@@ -436,19 +455,23 @@ class TocTree(QTreeWidget):
             new_parent.setExpanded(True)
         else:
             idx = self.indexOfTopLevelItem(item)
-            if idx == 0:
+            if idx <= 0:
                 return
             new_parent = self.topLevelItem(idx - 1)
             self.takeTopLevelItem(idx)
             new_parent.addChild(item)
             new_parent.setExpanded(True)
-        self.setCurrentItem(item)
 
     def dedent_selected(self):
-        '''Move the selected item up one level, placing it after its parent.'''
-        item = self.currentItem()
-        if not item:
-            return
+        '''Move each selected item one level up, placing it after its parent.
+        Items already at top level are skipped.'''
+        items = self._items_in_tree_order(self.selectedItems())
+        for item in items:
+            self._dedent_item(item)
+        for item in items:
+            item.setSelected(True)
+
+    def _dedent_item(self, item):
         parent = item.parent()
         if not parent:
             return
@@ -461,7 +484,6 @@ class TocTree(QTreeWidget):
             idx = self.indexOfTopLevelItem(parent)
             parent.removeChild(item)
             self.insertTopLevelItem(idx + 1, item)
-        self.setCurrentItem(item)
 
     def dump_entries(self):
         '''Walk tree and return a flat list of TocEntry. Raises TocParseError
@@ -643,14 +665,19 @@ class EmbedTocDialog(QDialog):
         header.setWordWrap(True)
         layout.addWidget(header)
 
-        # --- Offset widgets (placed inside the Table tab; created here so
-        # they exist before any tab is built, since load/tab-change code
-        # references them).
+        # --- Offset widgets (one pair per tab that shows them; created here
+        # so they exist before tabs are built). Both pairs are kept in sync
+        # on every tab switch via _on_tab_changed / _update_offset_state.
         self.offset_spin = QSpinBox()
         self.offset_spin.setRange(-100000, 100000)
         self.offset_spin.setValue(0)
         self.offset_note = QLabel('')
         self.offset_note.setStyleSheet('color: gray;')
+        self.tree_offset_spin = QSpinBox()
+        self.tree_offset_spin.setRange(-100000, 100000)
+        self.tree_offset_spin.setValue(0)
+        self.tree_offset_note = QLabel('')
+        self.tree_offset_note.setStyleSheet('color: gray;')
 
         # --- Tabs ---
         self.tabs = QTabWidget()
@@ -741,6 +768,15 @@ class EmbedTocDialog(QDialog):
         v.setContentsMargins(0, 0, 0, 0)
 
         toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel('Global page offset:'))
+        toolbar.addWidget(self.tree_offset_spin)
+        toolbar.addWidget(self.tree_offset_note)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        toolbar.addWidget(sep)
+
         add_btn = QPushButton('Add entry')
         add_btn.clicked.connect(lambda: self.toc_tree.add_entry())
         toolbar.addWidget(add_btn)
@@ -750,12 +786,12 @@ class EmbedTocDialog(QDialog):
         toolbar.addWidget(del_btn)
 
         indent_btn = QPushButton('Indent →')
-        indent_btn.setToolTip('Make the selected item a child of the item above it')
+        indent_btn.setToolTip('Make each selected item a child of the item above it')
         indent_btn.clicked.connect(lambda: self.toc_tree.indent_selected())
         toolbar.addWidget(indent_btn)
 
         dedent_btn = QPushButton('← Dedent')
-        dedent_btn.setToolTip('Move the selected item one level up')
+        dedent_btn.setToolTip('Move each selected item one level up')
         dedent_btn.clicked.connect(lambda: self.toc_tree.dedent_selected())
         toolbar.addWidget(dedent_btn)
 
@@ -816,6 +852,7 @@ class EmbedTocDialog(QDialog):
             try:
                 toc = parse_toc(text)
                 self.offset_spin.setValue(toc.offset)
+                self.tree_offset_spin.setValue(toc.offset)
                 self._update_offset_state(toc)
             except TocParseError:
                 # Don't block the user; they'll see the error when they try
@@ -861,6 +898,7 @@ class EmbedTocDialog(QDialog):
             self.toc_tree.load(toc.entries)
 
         self.offset_spin.setValue(toc.offset)
+        self.tree_offset_spin.setValue(toc.offset)
         self._update_offset_state(toc)
         self._current_tab = new_index
 
@@ -875,7 +913,7 @@ class EmbedTocDialog(QDialog):
 
     def _toc_from_tree(self):
         entries = self.toc_tree.dump_entries()
-        return ParsedToc(entries=entries, offset=self.offset_spin.value())
+        return ParsedToc(entries=entries, offset=self.tree_offset_spin.value())
 
     def _current_toc(self):
         '''Pull the current TOC from whichever tab is active. Raises
@@ -887,19 +925,26 @@ class EmbedTocDialog(QDialog):
         return self._toc_from_tree()
 
     def _update_offset_state(self, toc):
-        '''Enable the offset spinbox iff all entries have positive integer
-        pages. Update the note label to explain when disabled.'''
+        '''Enable both offset spinboxes iff all entries have positive integer
+        pages. Update the note labels to explain when disabled.'''
         if not toc.entries:
+            msg = '(disabled: no entries yet)'
             self.offset_spin.setEnabled(False)
-            self.offset_note.setText('(disabled: no entries yet)')
+            self.offset_note.setText(msg)
+            self.tree_offset_spin.setEnabled(False)
+            self.tree_offset_note.setText(msg)
             return
         if all_pages_numeric(toc):
             self.offset_spin.setEnabled(True)
             self.offset_note.setText('')
+            self.tree_offset_spin.setEnabled(True)
+            self.tree_offset_note.setText('')
         else:
+            msg = '(disabled: non-numeric page labels present)'
             self.offset_spin.setEnabled(False)
-            self.offset_note.setText(
-                '(disabled: non-numeric page labels present)')
+            self.offset_note.setText(msg)
+            self.tree_offset_spin.setEnabled(False)
+            self.tree_offset_note.setText(msg)
 
     # ---- Clean PDF ----
 

@@ -2,7 +2,7 @@
 Main dialog for Embed ToC.
 
 UI flow:
-    - Tabbed editor: Text tab (QPlainTextEdit) and Table tab (QTableWidget).
+    - Tabbed editor: Text tab (QPlainTextEdit) and Tree tab (QTreeWidget).
     - Both views share an in-memory ParsedToc. Switching tabs serializes the
       currently active view into ParsedToc and re-populates the other.
     - If parsing fails when leaving a tab, the switch is blocked and the
@@ -19,9 +19,10 @@ import subprocess
 import sys
 
 from qt.core import (
-    QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QHeaderView,
-    QIcon, QLabel, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox,
-    QTableWidget, QTableWidgetItem, QTabWidget, Qt, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
+    QFrame, QHBoxLayout, QHeaderView, QIcon, QLabel, QMessageBox,
+    QPlainTextEdit, QPushButton, QSpinBox, QTabWidget, Qt,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from calibre.gui2 import error_dialog, gprefs, info_dialog, question_dialog
@@ -166,163 +167,270 @@ class TocTextEdit(QPlainTextEdit):
         cursor.endEditBlock()
 
 
-# ---------- Table widget ----------
+# ---------- Tree widget ----------
 
-class TocTable(QTableWidget):
-    '''Three columns: Indent Level, Title, Page.'''
+class TocTree(QTreeWidget):
+    '''Two columns: Title and Page. Level is implicit from tree depth.
+    Supports drag-and-drop reordering and re-parenting (InternalMove).
 
-    COL_LEVEL = 0
-    COL_TITLE = 1
-    COL_PAGE = 2
+    Warnings (⚠ icon + tooltip on the Title cell):
+      - Level skip: an entry whose declared indent level in the source data
+        skips a level (e.g. jumps from depth 1 to depth 3). Detected only
+        on load(); cleared by any subsequent structural edit.
+      - Page out of order: a numeric page that is less than the preceding
+        numeric page in DFS pre-order. Recomputed live after every edit.
+    '''
+
+    COL_TITLE = 0
+    COL_PAGE = 1
 
     def __init__(self, parent=None):
-        super().__init__(0, 3, parent)
-        self.setHorizontalHeaderLabels(['Indent Level', 'Title', 'Page'])
-        header = self.horizontalHeader()
-        # Interactive mode lets the user drag column edges. The Title column
-        # gets a stretch behavior so it absorbs extra width by default but
-        # the user can still drag it.
-        header.setSectionResizeMode(self.COL_LEVEL, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(self.COL_TITLE, QHeaderView.ResizeMode.Interactive)
+        super().__init__(parent)
+        self.setColumnCount(2)
+        self.setHeaderLabels(['Title', 'Page'])
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setDropIndicatorShown(True)
+        self.setRootIsDecorated(True)
+        header = self.header()
+        header.setSectionResizeMode(self.COL_TITLE, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(self.COL_PAGE, QHeaderView.ResizeMode.Interactive)
-        header.setStretchLastSection(False)
-        # Sensible initial widths so the table doesn't open with a flush-left
-        # Title column hugging Indent Level.
-        self.setColumnWidth(self.COL_LEVEL, 100)
-        self.setColumnWidth(self.COL_TITLE, 480)
         self.setColumnWidth(self.COL_PAGE, 80)
-        self.verticalHeader().setVisible(False)
-        self.setSelectionBehavior(self.SelectionBehavior.SelectRows)
+        self.itemChanged.connect(lambda _: self.refresh_warnings())
 
-    def load(self, entries):
-        self.setRowCount(0)
-        for entry in entries:
-            self._append_row(entry.title, entry.page, str(entry.level))
-        self.refresh_level_warnings()
+    # ---- Warning helpers ----
 
-    def _append_row(self, title, page, level):
-        row = self.rowCount()
-        self.insertRow(row)
-        self.setItem(row, self.COL_LEVEL, QTableWidgetItem(level))
-        self.setItem(row, self.COL_TITLE, QTableWidgetItem(title))
-        self.setItem(row, self.COL_PAGE, QTableWidgetItem(page))
+    def _warn_icon(self):
+        return self.style().standardIcon(
+            self.style().StandardPixmap.SP_MessageBoxWarning)
 
-    def add_blank_row(self):
-        self._append_row('', '', '0')
-        self.setCurrentCell(self.rowCount() - 1, self.COL_TITLE)
-        self.editItem(self.currentItem())
-        self.refresh_level_warnings()
+    def _append_warning(self, item, msg):
+        existing = item.toolTip(self.COL_TITLE)
+        new_tip = (existing + '\n' + msg) if existing else msg
+        item.setIcon(self.COL_TITLE, self._warn_icon())
+        item.setToolTip(self.COL_TITLE, new_tip)
 
-    def remove_selected_rows(self):
-        rows = sorted({i.row() for i in self.selectedIndexes()}, reverse=True)
-        for r in rows:
-            self.removeRow(r)
-        self.refresh_level_warnings()
+    def _clear_warning(self, item):
+        item.setIcon(self.COL_TITLE, QIcon())
+        item.setToolTip(self.COL_TITLE, '')
 
-    def refresh_level_warnings(self):
-        '''Decorate the Indent Level cell of the first row whose level is
-        invalid (first row not 0, or skips a level relative to predecessors).
-        Only the first offender is marked; fixing it reveals the next.
+    def _dfs_items(self):
+        result = []
+        def walk(item):
+            result.append(item)
+            for i in range(item.childCount()):
+                walk(item.child(i))
+        for i in range(self.topLevelItemCount()):
+            walk(self.topLevelItem(i))
+        return result
 
-        Rules:
-            - Row 0's level must be 0.
-            - For row i > 0, level[i] must be <= max(level[0..i-1]) + 1.
-              In other words, you can go deeper by at most one level at a
-              time, but can pop back up arbitrarily.
-        '''
-        # Block signals so setIcon/setToolTip don't re-trigger itemChanged
-        # and cause infinite recursion.
+    def _check_page_order(self, items):
+        '''Flag items whose numeric page is less than the preceding numeric page.'''
+        prev_page = None
+        for item in items:
+            try:
+                page = int(item.text(self.COL_PAGE).strip())
+            except ValueError:
+                continue  # Non-numeric: skip but don't reset the reference.
+            if prev_page is not None and page < prev_page:
+                self._append_warning(
+                    item,
+                    f'Page {page} is less than the preceding numeric page {prev_page}.')
+            prev_page = page
+
+    def refresh_warnings(self):
+        '''Clear all warnings and recheck page ordering. Called after any
+        structural edit or in-place cell change.'''
         self.blockSignals(True)
         try:
-            self._do_refresh_level_warnings()
+            items = self._dfs_items()
+            for item in items:
+                self._clear_warning(item)
+            self._check_page_order(items)
         finally:
             self.blockSignals(False)
 
-    def _do_refresh_level_warnings(self):
-        warn_icon = self.style().standardIcon(
-            self.style().StandardPixmap.SP_MessageBoxWarning)
+    def dropEvent(self, event):
+        super().dropEvent(event)
+        self.refresh_warnings()
 
-        max_seen = -1
-        first_bad_row = None
-        first_bad_msg = None
+    # ---- Item construction ----
 
-        for row in range(self.rowCount()):
-            item = self.item(row, self.COL_LEVEL)
-            text = (item.text() if item else '').strip()
-            # Blank-row guard: blank rows are skipped at dump time, so don't
-            # flag them here either.
-            title_item = self.item(row, self.COL_TITLE)
-            page_item = self.item(row, self.COL_PAGE)
-            title = (title_item.text() if title_item else '').strip()
-            page = (page_item.text() if page_item else '').strip()
-            if not title and not page and not text:
-                continue
-            try:
-                level = int(text) if text else 0
-            except ValueError:
-                if first_bad_row is None:
-                    first_bad_row = row
-                    first_bad_msg = (f'Indent level {text!r} is not an integer.')
-                break
+    def _make_item(self, title, page):
+        item = QTreeWidgetItem([title, page])
+        item.setFlags(
+            Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsSelectable
+            | Qt.ItemFlag.ItemIsEditable
+            | Qt.ItemFlag.ItemIsDragEnabled
+            | Qt.ItemFlag.ItemIsDropEnabled
+        )
+        return item
 
-            if max_seen == -1:
-                # First non-blank row -- must be level 0.
-                if level != 0:
-                    first_bad_row = row
-                    first_bad_msg = ('The first entry must have indent level 0, '
-                                     f'but this one has level {level}.')
-                    break
-                max_seen = 0
-            else:
-                if level > max_seen + 1:
-                    first_bad_row = row
-                    first_bad_msg = (
-                        f'Indent level {level} skips a level. '
-                        f'After a maximum depth of {max_seen}, the next '
-                        f'deeper allowed level is {max_seen + 1}.')
-                    break
-                if level > max_seen:
-                    max_seen = level
+    # ---- Load / dump ----
 
-        # Clear all decorations first.
-        for row in range(self.rowCount()):
-            cell = self.item(row, self.COL_LEVEL)
-            if cell is not None:
-                cell.setIcon(QIcon())
-                cell.setToolTip('')
-
-        if first_bad_row is not None:
-            cell = self.item(first_bad_row, self.COL_LEVEL)
-            if cell is None:
-                cell = QTableWidgetItem('')
-                self.setItem(first_bad_row, self.COL_LEVEL, cell)
-            cell.setIcon(warn_icon)
-            cell.setToolTip(first_bad_msg)
+    def load(self, entries):
+        self.blockSignals(True)
+        try:
+            self.clear()
+            if not entries:
+                return
+            # Stack-based reconstruction: stack holds (declared_level, item).
+            stack = []
+            for entry in entries:
+                item = self._make_item(entry.title, entry.page)
+                while stack and stack[-1][0] >= entry.level:
+                    stack.pop()
+                parent_level = stack[-1][0] if stack else -1
+                if stack:
+                    stack[-1][1].addChild(item)
+                else:
+                    self.addTopLevelItem(item)
+                stack.append((entry.level, item))
+                # Warn if the declared level skips over one or more levels.
+                if entry.level > parent_level + 1:
+                    self._append_warning(
+                        item,
+                        f'Indentation skips a level: declared level {entry.level}, '
+                        f'but the deepest available level here is {parent_level + 1}.')
+            self.expandAll()
+            self._check_page_order(self._dfs_items())
+        finally:
+            self.blockSignals(False)
 
     def dump_entries(self):
-        '''Read rows back into TocEntry objects. Raises TocParseError on
-        a malformed level value or empty required field.'''
+        '''Walk tree and return a flat list of TocEntry. Raises TocParseError
+        if any item is missing a title or page.'''
         out = []
-        for row in range(self.rowCount()):
-            title = (self.item(row, self.COL_TITLE) or QTableWidgetItem('')).text().strip()
-            page = (self.item(row, self.COL_PAGE) or QTableWidgetItem('')).text().strip()
-            level_text = (self.item(row, self.COL_LEVEL) or QTableWidgetItem('0')).text().strip() or '0'
-            if not title and not page:
-                # Skip fully blank rows silently.
-                continue
-            if not title:
-                raise TocParseError(f'Row {row + 1}: title is empty.')
-            if not page:
-                raise TocParseError(f'Row {row + 1}: page is empty.')
-            try:
-                level = int(level_text)
-            except ValueError:
-                raise TocParseError(
-                    f'Row {row + 1}: indent level {level_text!r} is not an integer.')
-            if level < 0:
-                raise TocParseError(f'Row {row + 1}: indent level must be >= 0.')
-            out.append(TocEntry(title=title, page=page, level=level))
+        for i in range(self.topLevelItemCount()):
+            self._collect(self.topLevelItem(i), 0, out)
         return out
+
+    def _collect(self, item, level, out):
+        title = item.text(self.COL_TITLE).strip()
+        page = item.text(self.COL_PAGE).strip()
+        if title or page:
+            if not title:
+                raise TocParseError(f'An entry has a page ({page!r}) but no title.')
+            if not page:
+                raise TocParseError(f'Entry {title!r} has no page.')
+            out.append(TocEntry(title=title, page=page, level=level))
+        for i in range(item.childCount()):
+            self._collect(item.child(i), level + 1, out)
+
+    # ---- Editing operations ----
+
+    def add_entry(self):
+        '''Insert a blank sibling after the current item, or a top-level
+        item if nothing is selected.'''
+        current = self.currentItem()
+        item = self._make_item('', '')
+        if current:
+            parent = current.parent()
+            if parent:
+                idx = parent.indexOfChild(current)
+                parent.insertChild(idx + 1, item)
+            else:
+                idx = self.indexOfTopLevelItem(current)
+                self.insertTopLevelItem(idx + 1, item)
+        else:
+            self.addTopLevelItem(item)
+        self.setCurrentItem(item)
+        self.editItem(item, self.COL_TITLE)
+        self.refresh_warnings()
+
+    def delete_selected(self):
+        # Remove only items that aren't already descendants of another selected
+        # item (removing a parent takes its subtree, so the child is gone too).
+        selected = self.selectedItems()
+        if not selected:
+            return
+        selected_ids = {id(it) for it in selected}
+
+        def has_selected_ancestor(item):
+            p = item.parent()
+            while p:
+                if id(p) in selected_ids:
+                    return True
+                p = p.parent()
+            return False
+
+        roots = [it for it in selected if not has_selected_ancestor(it)]
+        for item in roots:
+            parent = item.parent()
+            if parent:
+                parent.removeChild(item)
+            else:
+                self.takeTopLevelItem(self.indexOfTopLevelItem(item))
+        self.refresh_warnings()
+
+    def _items_in_tree_order(self, items):
+        '''Return items sorted by DFS pre-order position in the tree.'''
+        item_ids = {id(it) for it in items}
+        result = []
+
+        def walk(item):
+            if id(item) in item_ids:
+                result.append(item)
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+        for i in range(self.topLevelItemCount()):
+            walk(self.topLevelItem(i))
+        return result
+
+    def indent_selected(self):
+        '''Make each selected item a child of its preceding sibling.'''
+        items = self._items_in_tree_order(self.selectedItems())
+        for item in items:
+            self._indent_item(item)
+        for item in items:
+            item.setSelected(True)
+        self.refresh_warnings()
+
+    def _indent_item(self, item):
+        parent = item.parent()
+        if parent:
+            idx = parent.indexOfChild(item)
+            if idx == 0:
+                return
+            new_parent = parent.child(idx - 1)
+            parent.removeChild(item)
+            new_parent.addChild(item)
+            new_parent.setExpanded(True)
+        else:
+            idx = self.indexOfTopLevelItem(item)
+            if idx <= 0:
+                return
+            new_parent = self.topLevelItem(idx - 1)
+            self.takeTopLevelItem(idx)
+            new_parent.addChild(item)
+            new_parent.setExpanded(True)
+
+    def dedent_selected(self):
+        '''Move each selected item one level up, placing it after its parent.
+        Items already at top level are skipped.'''
+        items = self._items_in_tree_order(self.selectedItems())
+        for item in items:
+            self._dedent_item(item)
+        for item in items:
+            item.setSelected(True)
+        self.refresh_warnings()
+
+    def _dedent_item(self, item):
+        parent = item.parent()
+        if not parent:
+            return
+        grandparent = parent.parent()
+        if grandparent:
+            idx = grandparent.indexOfChild(parent)
+            parent.removeChild(item)
+            grandparent.insertChild(idx + 1, item)
+        else:
+            idx = self.indexOfTopLevelItem(parent)
+            parent.removeChild(item)
+            self.insertTopLevelItem(idx + 1, item)
 
 
 # ---------- PDF health-check dialog ----------
@@ -418,7 +526,7 @@ class _PdfHealthDialog(QDialog):
 class EmbedTocDialog(QDialog):
 
     TAB_TEXT = 0
-    TAB_TABLE = 1
+    TAB_TREE = 1
 
     def __init__(self, parent, pdf_path, book_title='Untitled'):
         super().__init__(parent)
@@ -458,20 +566,23 @@ class EmbedTocDialog(QDialog):
         geom = gprefs.get('embed_pdf_toc_dialog_geometry')
         if geom:
             self.restoreGeometry(bytes(geom))
-        col_widths = gprefs.get('embed_pdf_toc_table_col_widths')
-        if col_widths and len(col_widths) == 3:
-            for col, width in enumerate(col_widths):
-                self.table.setColumnWidth(col, width)
 
     def _save_geometry(self):
         gprefs['embed_pdf_toc_dialog_geometry'] = bytearray(self.saveGeometry())
-        gprefs['embed_pdf_toc_table_col_widths'] = [
-            self.table.columnWidth(col) for col in range(3)
-        ]
 
     def done(self, result):
+        self._autosave_toc()
         self._save_geometry()
         super().done(result)
+
+    def _autosave_toc(self):
+        '''Persist the current TOC to disk on any close path (including Cancel).
+        Silently skips if the editor content can't be parsed.'''
+        try:
+            toc = self._current_toc()
+            self._save_toc_file(toc)
+        except (TocParseError, OSError):
+            pass
 
     # ---- UI construction ----
 
@@ -483,9 +594,8 @@ class EmbedTocDialog(QDialog):
         header.setWordWrap(True)
         layout.addWidget(header)
 
-        # --- Offset widgets (placed inside the Table tab; created here so
-        # they exist before any tab is built, since load/tab-change code
-        # references them).
+        # --- Offset widget (tree tab only; created here so load code can
+        # reference it before the tab is built).
         self.offset_spin = QSpinBox()
         self.offset_spin.setRange(-100000, 100000)
         self.offset_spin.setValue(0)
@@ -505,8 +615,8 @@ class EmbedTocDialog(QDialog):
         self.text_edit.setFont(font)
         self.tabs.addTab(self._wrap_text_tab(), 'Text')
 
-        # Table tab
-        self.tabs.addTab(self._wrap_table_tab(), 'Table')
+        # Tree tab
+        self.tabs.addTab(self._wrap_tree_tab(), 'Tree')
 
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
@@ -535,8 +645,6 @@ class EmbedTocDialog(QDialog):
         bottom.addWidget(self.button_box)
         layout.addLayout(bottom)
 
-        # Initial offset-enabled state will be set after the TOC loads.
-
     def _wrap_text_tab(self):
         w = QWidget()
         v = QVBoxLayout(w)
@@ -544,39 +652,60 @@ class EmbedTocDialog(QDialog):
         v.addWidget(self.text_edit)
         return w
 
-    def _wrap_table_tab(self):
+    def _wrap_tree_tab(self):
         w = QWidget()
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 0, 0, 0)
 
-        # Single top bar: offset input on the left, add/delete row buttons
-        # on the right, separated by a stretch.
-        top_bar = QHBoxLayout()
-        top_bar.addWidget(QLabel('Global page offset:'))
-        top_bar.addWidget(self.offset_spin)
-        top_bar.addWidget(self.offset_note)
-        top_bar.addStretch(1)
-        self.add_row_btn = QPushButton('Add row')
-        self.add_row_btn.clicked.connect(lambda: self.table.add_blank_row())
-        top_bar.addWidget(self.add_row_btn)
-        self.del_row_btn = QPushButton('Delete selected')
-        self.del_row_btn.clicked.connect(lambda: self.table.remove_selected_rows())
-        top_bar.addWidget(self.del_row_btn)
-        v.addLayout(top_bar)
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel('Global page offset:'))
+        toolbar.addWidget(self.offset_spin)
+        toolbar.addWidget(self.offset_note)
 
-        self.table = TocTable()
-        # Refresh indent-level warnings whenever a cell changes. Wrap in a
-        # guard inside the slot so we don't recurse when refresh() itself
-        # mutates icons (which doesn't fire itemChanged, but be safe).
-        self.table.itemChanged.connect(lambda _: self.table.refresh_level_warnings())
-        v.addWidget(self.table, 1)
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        toolbar.addWidget(sep)
+
+        add_btn = QPushButton('Add entry')
+        add_btn.clicked.connect(lambda: self.toc_tree.add_entry())
+        toolbar.addWidget(add_btn)
+
+        del_btn = QPushButton('Delete selected')
+        del_btn.clicked.connect(lambda: self.toc_tree.delete_selected())
+        toolbar.addWidget(del_btn)
+
+        indent_btn = QPushButton('Indent →')
+        indent_btn.setToolTip('Make each selected item a child of the item above it')
+        indent_btn.clicked.connect(lambda: self.toc_tree.indent_selected())
+        toolbar.addWidget(indent_btn)
+
+        dedent_btn = QPushButton('← Dedent')
+        dedent_btn.setToolTip('Move each selected item one level up')
+        dedent_btn.clicked.connect(lambda: self.toc_tree.dedent_selected())
+        toolbar.addWidget(dedent_btn)
+
+        toolbar.addStretch(1)
+
+        expand_btn = QPushButton('Expand all')
+        expand_btn.clicked.connect(lambda: self.toc_tree.expandAll())
+        toolbar.addWidget(expand_btn)
+
+        collapse_btn = QPushButton('Collapse all')
+        collapse_btn.clicked.connect(lambda: self.toc_tree.collapseAll())
+        toolbar.addWidget(collapse_btn)
+
+        v.addLayout(toolbar)
+
+        self.toc_tree = TocTree()
+        v.addWidget(self.toc_tree, 1)
         return w
 
     # ---- TOC load/save ----
 
     def _load_initial_toc(self):
-        '''Read the saved TOC file if present. Populate text view; the
-        table is populated lazily on first tab switch.
+        '''Read the saved TOC file if present. Populate text view; tree is
+        populated lazily on first tab switch.
 
         Also handles a one-time migration from v0.1.0 layout: TOC and
         backup used to live next to the PDF rather than in data/.
@@ -638,7 +767,7 @@ class EmbedTocDialog(QDialog):
             if leaving == self.TAB_TEXT:
                 toc = self._toc_from_text()
             else:
-                toc = self._toc_from_table()
+                toc = self._toc_from_tree()
         except TocParseError as e:
             # Block the switch and revert.
             self._suppress_tab_handler = True
@@ -651,7 +780,7 @@ class EmbedTocDialog(QDialog):
         if new_index == self.TAB_TEXT:
             self.text_edit.setPlainText(serialize_toc(toc))
         else:
-            self.table.load(toc.entries)
+            self.toc_tree.load(toc.entries)
 
         self.offset_spin.setValue(toc.offset)
         self._update_offset_state(toc)
@@ -662,8 +791,8 @@ class EmbedTocDialog(QDialog):
         # truth -- the spin box is hidden on this tab.
         return parse_toc(self.text_edit.toPlainText())
 
-    def _toc_from_table(self):
-        entries = self.table.dump_entries()
+    def _toc_from_tree(self):
+        entries = self.toc_tree.dump_entries()
         return ParsedToc(entries=entries, offset=self.offset_spin.value())
 
     def _current_toc(self):
@@ -671,7 +800,7 @@ class EmbedTocDialog(QDialog):
         TocParseError on parse failure.'''
         if self._current_tab == self.TAB_TEXT:
             return self._toc_from_text()
-        return self._toc_from_table()
+        return self._toc_from_tree()
 
     def _update_offset_state(self, toc):
         '''Enable the offset spinbox iff all entries have positive integer
@@ -753,15 +882,14 @@ class EmbedTocDialog(QDialog):
             except OSError as e:
                 return error_dialog(self, "Couldn't copy file", str(e), show=True)
 
-        # Load into the text view; reset the table so it'll be repopulated
-        # on next tab switch.
+        # Load into the text view; tree is repopulated on next tab switch.
         self.text_edit.setPlainText(text)
         try:
             toc = parse_toc(text)
             self.offset_spin.setValue(toc.offset)
             self._update_offset_state(toc)
-            if self._current_tab == self.TAB_TABLE:
-                self.table.load(toc.entries)
+            if self._current_tab == self.TAB_TREE:
+                self.toc_tree.load(toc.entries)
         except TocParseError as e:
             self._show_parse_error(e)
 

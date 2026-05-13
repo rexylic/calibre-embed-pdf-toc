@@ -18,7 +18,7 @@ class EmbedTocAction(InterfaceAction):
 
     # (display name, icon path or None, status tip, keyboard shortcut)
     # Keyboard shortcut left as None -- user can set one if they want.
-    action_spec = ('Embed PDF ToC', None,
+    action_spec = ('Embed ToC', None,
                    'Embed a navigable table of contents into the selected PDF', None)
 
     # The action targets the currently selected book(s) in the library.
@@ -29,6 +29,10 @@ class EmbedTocAction(InterfaceAction):
 
     # Don't place automatically; the user picks where it goes.
     auto_repeat = False
+
+    def initialization_complete(self):
+        self.gui.library_view.context_menu.addSeparator()
+        self.gui.library_view.context_menu.addAction(self.qaction)
 
     def genesis(self):
         # Try to load a custom icon; fall back to a builtin so the action

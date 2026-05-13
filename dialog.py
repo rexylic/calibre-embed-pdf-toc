@@ -1,0 +1,741 @@
+'''
+Main dialog for Embed ToC.
+
+UI flow:
+    - Tabbed editor: Text tab (QPlainTextEdit) and Table tab (QTableWidget).
+    - Both views share an in-memory ParsedToc. Switching tabs serializes the
+      currently active view into ParsedToc and re-populates the other.
+    - If parsing fails when leaving a tab, the switch is blocked and the
+      user sees an inline error.
+    - Apply button: validates page labels exist in the PDF, then writes.
+    - On failure (missing label): error dialog naming the entry, return to
+      editor.
+    - On success: a post-write dialog with Open PDF / Undo / Close.
+'''
+
+import os
+import shutil
+import subprocess
+import sys
+
+from qt.core import (
+    QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QHeaderView,
+    QIcon, QLabel, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox,
+    QTableWidget, QTableWidgetItem, QTabWidget, Qt, QVBoxLayout, QWidget,
+)
+
+from calibre.gui2 import error_dialog, info_dialog, question_dialog
+
+from calibre_plugins.toc_bookmarker.bookmarker.common import (
+    ParsedToc, TocEntry, TocParseError,
+    all_pages_numeric, parse_toc, serialize_toc,
+)
+from calibre_plugins.toc_bookmarker.bookmarker.pdf import (
+    BookmarkError, MissingPageLabel, write_bookmarks,
+)
+
+
+TOC_FILENAME = 'toc'
+ORIGINAL_BACKUP_SUFFIX = '.original_pdf'
+
+PLACEHOLDER = (
+    "# Example TOC. Indentation defines nesting; the last token on each line\n"
+    "# is the page label (numeric or roman, e.g. 'v', 'ix').\n"
+    "#\n"
+    "# A '# offset: N' line applies a global integer offset to numeric\n"
+    "# entries when writing -- useful when the printed page numbers are\n"
+    "# off from the PDF's internal page labels.\n"
+    "#\n"
+    "Preface v\n"
+    "Chapter 1 Introduction 1\n"
+    "    1.1 Background 3\n"
+    "    1.2 Outline 8\n"
+    "Chapter 2 Methods 15\n"
+)
+
+
+TAB_WIDTH = 4
+_SOFT_TAB = ' ' * TAB_WIDTH
+
+
+class TocTextEdit(QPlainTextEdit):
+    '''A QPlainTextEdit with soft tabs (TAB_WIDTH spaces) and Shift+Tab
+    dedent. Also fixes the tab-stop display width so tab characters in
+    loaded files render at TAB_WIDTH columns instead of Qt's default 8.'''
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTabChangesFocus(False)
+        self._apply_tab_stop_distance()
+
+    def setFont(self, font):
+        super().setFont(font)
+        self._apply_tab_stop_distance()
+
+    def _apply_tab_stop_distance(self):
+        # Pixel width of TAB_WIDTH spaces in the current font. Set this as
+        # the tab stop so a literal '\t' renders at the same width as our
+        # soft-tab insertions.
+        metrics = self.fontMetrics()
+        # horizontalAdvance is available in Qt 5.11+; safe for Calibre.
+        try:
+            space_w = metrics.horizontalAdvance(' ')
+        except AttributeError:
+            space_w = metrics.width(' ')
+        self.setTabStopDistance(space_w * TAB_WIDTH)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+
+        # Shift+Tab: dedent the selection (or current line).
+        if key == Qt.Key.Key_Backtab:
+            self._dedent_selection()
+            return
+
+        if key == Qt.Key.Key_Tab:
+            cursor = self.textCursor()
+            if cursor.hasSelection():
+                self._indent_selection()
+                return
+            # No selection: insert TAB_WIDTH spaces aligned to the next
+            # tab column relative to the line start.
+            block_text = cursor.block().text()
+            col = cursor.positionInBlock()
+            # How many spaces to reach the next multiple of TAB_WIDTH?
+            spaces = TAB_WIDTH - (col % TAB_WIDTH)
+            if spaces == 0:
+                spaces = TAB_WIDTH
+            cursor.insertText(' ' * spaces)
+            return
+
+        super().keyPressEvent(event)
+
+    def _selected_block_range(self, cursor):
+        '''Return (first_block_number, last_block_number) covering the
+        cursor's selection (or just the cursor's current block if none).'''
+        if not cursor.hasSelection():
+            n = cursor.block().blockNumber()
+            return n, n
+        start = cursor.selectionStart()
+        end = cursor.selectionEnd()
+        doc = self.document()
+        a = doc.findBlock(start).blockNumber()
+        b = doc.findBlock(end).blockNumber()
+        # If the selection ends exactly at the start of a block, don't
+        # include that block in the range.
+        if doc.findBlock(end).position() == end and b > a:
+            b -= 1
+        return a, b
+
+    def _indent_selection(self):
+        cursor = self.textCursor()
+        first, last = self._selected_block_range(cursor)
+        doc = self.document()
+        cursor.beginEditBlock()
+        for bn in range(first, last + 1):
+            block = doc.findBlockByNumber(bn)
+            c = self.textCursor()
+            c.setPosition(block.position())
+            c.insertText(_SOFT_TAB)
+        cursor.endEditBlock()
+
+    def _dedent_selection(self):
+        cursor = self.textCursor()
+        first, last = self._selected_block_range(cursor)
+        doc = self.document()
+        cursor.beginEditBlock()
+        for bn in range(first, last + 1):
+            block = doc.findBlockByNumber(bn)
+            text = block.text()
+            # Remove up to TAB_WIDTH leading spaces, or a single leading tab.
+            to_remove = 0
+            if text.startswith('\t'):
+                to_remove = 1
+            else:
+                while to_remove < TAB_WIDTH and to_remove < len(text) and text[to_remove] == ' ':
+                    to_remove += 1
+            if to_remove == 0:
+                continue
+            c = self.textCursor()
+            c.setPosition(block.position())
+            c.setPosition(block.position() + to_remove,
+                          c.MoveMode.KeepAnchor)
+            c.removeSelectedText()
+        cursor.endEditBlock()
+
+
+# ---------- Table widget ----------
+
+class TocTable(QTableWidget):
+    '''Three columns: Indent Level, Title, Page.'''
+
+    COL_LEVEL = 0
+    COL_TITLE = 1
+    COL_PAGE = 2
+
+    def __init__(self, parent=None):
+        super().__init__(0, 3, parent)
+        self.setHorizontalHeaderLabels(['Indent Level', 'Title', 'Page'])
+        header = self.horizontalHeader()
+        # Interactive mode lets the user drag column edges. The Title column
+        # gets a stretch behavior so it absorbs extra width by default but
+        # the user can still drag it.
+        header.setSectionResizeMode(self.COL_LEVEL, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(self.COL_TITLE, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(self.COL_PAGE, QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(False)
+        # Sensible initial widths so the table doesn't open with a flush-left
+        # Title column hugging Indent Level.
+        self.setColumnWidth(self.COL_LEVEL, 100)
+        self.setColumnWidth(self.COL_TITLE, 480)
+        self.setColumnWidth(self.COL_PAGE, 80)
+        self.verticalHeader().setVisible(False)
+        self.setSelectionBehavior(self.SelectionBehavior.SelectRows)
+
+    def load(self, entries):
+        self.setRowCount(0)
+        for entry in entries:
+            self._append_row(entry.title, entry.page, str(entry.level))
+        self.refresh_level_warnings()
+
+    def _append_row(self, title, page, level):
+        row = self.rowCount()
+        self.insertRow(row)
+        self.setItem(row, self.COL_LEVEL, QTableWidgetItem(level))
+        self.setItem(row, self.COL_TITLE, QTableWidgetItem(title))
+        self.setItem(row, self.COL_PAGE, QTableWidgetItem(page))
+
+    def add_blank_row(self):
+        self._append_row('', '', '0')
+        self.setCurrentCell(self.rowCount() - 1, self.COL_TITLE)
+        self.editItem(self.currentItem())
+        self.refresh_level_warnings()
+
+    def remove_selected_rows(self):
+        rows = sorted({i.row() for i in self.selectedIndexes()}, reverse=True)
+        for r in rows:
+            self.removeRow(r)
+        self.refresh_level_warnings()
+
+    def refresh_level_warnings(self):
+        '''Decorate the Indent Level cell of the first row whose level is
+        invalid (first row not 0, or skips a level relative to predecessors).
+        Only the first offender is marked; fixing it reveals the next.
+
+        Rules:
+            - Row 0's level must be 0.
+            - For row i > 0, level[i] must be <= max(level[0..i-1]) + 1.
+              In other words, you can go deeper by at most one level at a
+              time, but can pop back up arbitrarily.
+        '''
+        # Block signals so setIcon/setToolTip don't re-trigger itemChanged
+        # and cause infinite recursion.
+        self.blockSignals(True)
+        try:
+            self._do_refresh_level_warnings()
+        finally:
+            self.blockSignals(False)
+
+    def _do_refresh_level_warnings(self):
+        warn_icon = self.style().standardIcon(
+            self.style().StandardPixmap.SP_MessageBoxWarning)
+
+        max_seen = -1
+        first_bad_row = None
+        first_bad_msg = None
+
+        for row in range(self.rowCount()):
+            item = self.item(row, self.COL_LEVEL)
+            text = (item.text() if item else '').strip()
+            # Blank-row guard: blank rows are skipped at dump time, so don't
+            # flag them here either.
+            title_item = self.item(row, self.COL_TITLE)
+            page_item = self.item(row, self.COL_PAGE)
+            title = (title_item.text() if title_item else '').strip()
+            page = (page_item.text() if page_item else '').strip()
+            if not title and not page and not text:
+                continue
+            try:
+                level = int(text) if text else 0
+            except ValueError:
+                if first_bad_row is None:
+                    first_bad_row = row
+                    first_bad_msg = (f'Indent level {text!r} is not an integer.')
+                break
+
+            if max_seen == -1:
+                # First non-blank row -- must be level 0.
+                if level != 0:
+                    first_bad_row = row
+                    first_bad_msg = ('The first entry must have indent level 0, '
+                                     f'but this one has level {level}.')
+                    break
+                max_seen = 0
+            else:
+                if level > max_seen + 1:
+                    first_bad_row = row
+                    first_bad_msg = (
+                        f'Indent level {level} skips a level. '
+                        f'After a maximum depth of {max_seen}, the next '
+                        f'deeper allowed level is {max_seen + 1}.')
+                    break
+                if level > max_seen:
+                    max_seen = level
+
+        # Clear all decorations first.
+        for row in range(self.rowCount()):
+            cell = self.item(row, self.COL_LEVEL)
+            if cell is not None:
+                cell.setIcon(QIcon())
+                cell.setToolTip('')
+
+        if first_bad_row is not None:
+            cell = self.item(first_bad_row, self.COL_LEVEL)
+            if cell is None:
+                cell = QTableWidgetItem('')
+                self.setItem(first_bad_row, self.COL_LEVEL, cell)
+            cell.setIcon(warn_icon)
+            cell.setToolTip(first_bad_msg)
+
+    def dump_entries(self):
+        '''Read rows back into TocEntry objects. Raises TocParseError on
+        a malformed level value or empty required field.'''
+        out = []
+        for row in range(self.rowCount()):
+            title = (self.item(row, self.COL_TITLE) or QTableWidgetItem('')).text().strip()
+            page = (self.item(row, self.COL_PAGE) or QTableWidgetItem('')).text().strip()
+            level_text = (self.item(row, self.COL_LEVEL) or QTableWidgetItem('0')).text().strip() or '0'
+            if not title and not page:
+                # Skip fully blank rows silently.
+                continue
+            if not title:
+                raise TocParseError(f'Row {row + 1}: title is empty.')
+            if not page:
+                raise TocParseError(f'Row {row + 1}: page is empty.')
+            try:
+                level = int(level_text)
+            except ValueError:
+                raise TocParseError(
+                    f'Row {row + 1}: indent level {level_text!r} is not an integer.')
+            if level < 0:
+                raise TocParseError(f'Row {row + 1}: indent level must be >= 0.')
+            out.append(TocEntry(title=title, page=page, level=level))
+        return out
+
+
+# ---------- Main dialog ----------
+
+class EmbedTocDialog(QDialog):
+
+    TAB_TEXT = 0
+    TAB_TABLE = 1
+
+    def __init__(self, parent, pdf_path, book_title='Untitled'):
+        super().__init__(parent)
+        self.pdf_path = pdf_path
+        self.book_folder = os.path.dirname(pdf_path)
+        self.data_folder = os.path.join(self.book_folder, 'data')
+        # Make sure the data folder exists; harmless if it already does.
+        os.makedirs(self.data_folder, exist_ok=True)
+        self.toc_path = os.path.join(self.data_folder, TOC_FILENAME)
+        # The backup of the original PDF lives in data/ with suffix
+        # '.original_pdf' (extensionless). Only ever written once.
+        pdf_basename = os.path.basename(pdf_path)
+        pdf_stem, _ = os.path.splitext(pdf_basename)
+        self.backup_path = os.path.join(
+            self.data_folder, pdf_stem + ORIGINAL_BACKUP_SUFFIX)
+        self.book_title = book_title
+
+        # Track which tab the user is leaving so we know which side to parse.
+        self._current_tab = self.TAB_TEXT
+        # Set during a programmatic tab switch to suppress re-entry into
+        # the change handler.
+        self._suppress_tab_handler = False
+
+        self.setWindowTitle(f'Embed ToC — {book_title}')
+        self.resize(900, 700)
+
+        self._build_ui()
+        self._load_initial_toc()
+
+    # ---- UI construction ----
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        header = QLabel(f'<b>PDF:</b> {self.pdf_path}')
+        header.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        # --- Offset widgets (placed inside the Table tab; created here so
+        # they exist before any tab is built, since load/tab-change code
+        # references them).
+        self.offset_spin = QSpinBox()
+        self.offset_spin.setRange(-100000, 100000)
+        self.offset_spin.setValue(0)
+        self.offset_note = QLabel('')
+        self.offset_note.setStyleSheet('color: gray;')
+
+        # --- Tabs ---
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs, 1)
+
+        # Text tab
+        self.text_edit = TocTextEdit()
+        self.text_edit.setPlaceholderText(PLACEHOLDER)
+        font = self.text_edit.font()
+        font.setFamily('Menlo')   # falls back gracefully if unavailable
+        font.setStyleHint(font.StyleHint.Monospace)
+        self.text_edit.setFont(font)
+        self.tabs.addTab(self._wrap_text_tab(), 'Text')
+
+        # Table tab
+        self.tabs.addTab(self._wrap_table_tab(), 'Table')
+
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        # --- Bottom button bar ---
+        bottom = QHBoxLayout()
+        self.load_btn = QPushButton('Load from file…')
+        self.load_btn.clicked.connect(self._on_load_from_file)
+        bottom.addWidget(self.load_btn)
+        bottom.addStretch(1)
+
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Apply
+            | QDialogButtonBox.StandardButton.Close)
+        self.button_box.button(QDialogButtonBox.StandardButton.Apply).setText('Apply')
+        self.button_box.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self._on_apply)
+        self.button_box.button(QDialogButtonBox.StandardButton.Close).clicked.connect(self.reject)
+        bottom.addWidget(self.button_box)
+        layout.addLayout(bottom)
+
+        # Initial offset-enabled state will be set after the TOC loads.
+
+    def _wrap_text_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.addWidget(self.text_edit)
+        return w
+
+    def _wrap_table_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+
+        # Single top bar: offset input on the left, add/delete row buttons
+        # on the right, separated by a stretch.
+        top_bar = QHBoxLayout()
+        top_bar.addWidget(QLabel('Global page offset:'))
+        top_bar.addWidget(self.offset_spin)
+        top_bar.addWidget(self.offset_note)
+        top_bar.addStretch(1)
+        self.add_row_btn = QPushButton('Add row')
+        self.add_row_btn.clicked.connect(lambda: self.table.add_blank_row())
+        top_bar.addWidget(self.add_row_btn)
+        self.del_row_btn = QPushButton('Delete selected')
+        self.del_row_btn.clicked.connect(lambda: self.table.remove_selected_rows())
+        top_bar.addWidget(self.del_row_btn)
+        v.addLayout(top_bar)
+
+        self.table = TocTable()
+        # Refresh indent-level warnings whenever a cell changes. Wrap in a
+        # guard inside the slot so we don't recurse when refresh() itself
+        # mutates icons (which doesn't fire itemChanged, but be safe).
+        self.table.itemChanged.connect(lambda _: self.table.refresh_level_warnings())
+        v.addWidget(self.table, 1)
+        return w
+
+    # ---- TOC load/save ----
+
+    def _load_initial_toc(self):
+        '''Read the saved TOC file if present. Populate text view; the
+        table is populated lazily on first tab switch.
+
+        Also handles a one-time migration from v0.1.0 layout: TOC and
+        backup used to live next to the PDF rather than in data/.
+        '''
+        # Legacy migration: move <book>/toc -> <book>/data/toc if needed.
+        legacy_toc = os.path.join(self.book_folder, TOC_FILENAME)
+        if (os.path.isfile(legacy_toc)
+                and not os.path.isfile(self.toc_path)):
+            try:
+                shutil.move(legacy_toc, self.toc_path)
+            except OSError:
+                pass
+
+        # Legacy migration: move <book>.pdf.bak -> data/<stem>.original_pdf
+        # if no current-format backup exists.
+        legacy_bak = self.pdf_path + '.bak'
+        if (os.path.isfile(legacy_bak)
+                and not os.path.isfile(self.backup_path)):
+            try:
+                shutil.move(legacy_bak, self.backup_path)
+            except OSError:
+                pass
+
+        if os.path.isfile(self.toc_path):
+            try:
+                with open(self.toc_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+            except OSError as e:
+                error_dialog(self, "Couldn't read TOC file",
+                             f'{self.toc_path}\n\n{e}', show=True)
+                text = ''
+            self.text_edit.setPlainText(text)
+            # Initialize offset spin from saved file if possible.
+            try:
+                toc = parse_toc(text)
+                self.offset_spin.setValue(toc.offset)
+                self._update_offset_state(toc)
+            except TocParseError:
+                # Don't block the user; they'll see the error when they try
+                # to switch tabs or apply.
+                pass
+
+    def _save_toc_file(self, toc):
+        '''Write the current TOC to <book>/data/toc.'''
+        text = serialize_toc(toc)
+        with open(self.toc_path, 'w', encoding='utf-8') as f:
+            f.write(text)
+
+    # ---- Tab switching ----
+
+    def _on_tab_changed(self, new_index):
+        if self._suppress_tab_handler:
+            self._current_tab = new_index
+            return
+
+        # We're leaving _current_tab and entering new_index. Sync.
+        leaving = self._current_tab
+        try:
+            if leaving == self.TAB_TEXT:
+                toc = self._toc_from_text()
+            else:
+                toc = self._toc_from_table()
+        except TocParseError as e:
+            # Block the switch and revert.
+            self._suppress_tab_handler = True
+            self.tabs.setCurrentIndex(leaving)
+            self._suppress_tab_handler = False
+            self._show_parse_error(e)
+            return
+
+        # Push into the now-current side.
+        if new_index == self.TAB_TEXT:
+            self.text_edit.setPlainText(serialize_toc(toc))
+        else:
+            self.table.load(toc.entries)
+
+        self.offset_spin.setValue(toc.offset)
+        self._update_offset_state(toc)
+        self._current_tab = new_index
+
+    def _toc_from_text(self):
+        # In the text view, the '# offset: N' directive is the source of
+        # truth -- the spin box is hidden on this tab.
+        return parse_toc(self.text_edit.toPlainText())
+
+    def _toc_from_table(self):
+        entries = self.table.dump_entries()
+        return ParsedToc(entries=entries, offset=self.offset_spin.value())
+
+    def _current_toc(self):
+        '''Pull the current TOC from whichever tab is active. Raises
+        TocParseError on parse failure.'''
+        if self._current_tab == self.TAB_TEXT:
+            return self._toc_from_text()
+        return self._toc_from_table()
+
+    def _update_offset_state(self, toc):
+        '''Enable the offset spinbox iff all entries have positive integer
+        pages. Update the note label to explain when disabled.'''
+        if not toc.entries:
+            self.offset_spin.setEnabled(False)
+            self.offset_note.setText('(disabled: no entries yet)')
+            return
+        if all_pages_numeric(toc):
+            self.offset_spin.setEnabled(True)
+            self.offset_note.setText('')
+        else:
+            self.offset_spin.setEnabled(False)
+            self.offset_note.setText(
+                '(disabled: non-numeric page labels present)')
+
+    # ---- Load from external file ----
+
+    def _on_load_from_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Choose a TOC file', self.book_folder,
+            'TOC files (toc *.toc *.txt);;All files (*)')
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                text = f.read()
+        except OSError as e:
+            return error_dialog(self, "Couldn't read file", str(e), show=True)
+
+        same_file = os.path.abspath(path) == os.path.abspath(self.toc_path)
+        if not same_file:
+            # Copy to the book folder, prompting on overwrite.
+            if os.path.exists(self.toc_path):
+                if not question_dialog(
+                        self, 'Overwrite existing TOC?',
+                        f'A TOC file already exists at\n\n{self.toc_path}\n\n'
+                        'Replace it with the contents of the selected file?'):
+                    return
+            try:
+                shutil.copyfile(path, self.toc_path)
+            except OSError as e:
+                return error_dialog(self, "Couldn't copy file", str(e), show=True)
+
+        # Load into the text view; reset the table so it'll be repopulated
+        # on next tab switch.
+        self.text_edit.setPlainText(text)
+        try:
+            toc = parse_toc(text)
+            self.offset_spin.setValue(toc.offset)
+            self._update_offset_state(toc)
+            if self._current_tab == self.TAB_TABLE:
+                self.table.load(toc.entries)
+        except TocParseError as e:
+            self._show_parse_error(e)
+
+    # ---- Apply / write ----
+
+    def _on_apply(self):
+        try:
+            toc = self._current_toc()
+        except TocParseError as e:
+            return self._show_parse_error(e)
+
+        if not toc.entries:
+            return error_dialog(
+                self, 'Nothing to write',
+                'The TOC is empty. Add at least one entry, then try again.',
+                show=True)
+
+        apply_offset = all_pages_numeric(toc) and toc.offset != 0
+
+        # Persist the TOC file before attempting the write -- it makes
+        # iteration nicer if the write fails.
+        try:
+            self._save_toc_file(toc)
+        except OSError as e:
+            return error_dialog(self, "Couldn't save TOC file",
+                                f'{self.toc_path}\n\n{e}', show=True)
+
+        # Back up the original PDF -- but only once. If a backup already
+        # exists, leave it alone (it represents the truly-original file).
+        backup_existed_before = os.path.isfile(self.backup_path)
+        if not backup_existed_before:
+            try:
+                shutil.copyfile(self.pdf_path, self.backup_path)
+            except OSError as e:
+                return error_dialog(self, "Couldn't back up PDF",
+                                    f'{self.backup_path}\n\n{e}', show=True)
+
+        # Run the write. Errors are surfaced and we return to the editor.
+        try:
+            write_bookmarks(self.pdf_path, toc, apply_offset)
+        except MissingPageLabel as e:
+            error_dialog(
+                self, 'Page label not found',
+                f'The page label <b>{e.label}</b> for entry '
+                f'<b>{e.title}</b> was not found in this PDF.<br><br>'
+                'Fix the entry and try again.',
+                show=True)
+            # The PDF wasn't actually modified (write_bookmarks validates
+            # before writing, and the write is atomic). If we created the
+            # backup just now, remove it so we don't leave a confusing
+            # artifact behind for a run that didn't change anything.
+            if not backup_existed_before:
+                self._remove_backup_silently()
+            return
+        except BookmarkError as e:
+            error_dialog(self, 'Bookmark write failed', str(e), show=True)
+            if not backup_existed_before:
+                self._remove_backup_silently()
+            return
+        except Exception as e:
+            import traceback
+            error_dialog(self, 'Bookmark write failed',
+                         str(e), det_msg=traceback.format_exc(), show=True)
+            if not backup_existed_before:
+                self._remove_backup_silently()
+            return
+
+        self._show_post_write_dialog()
+
+    def _remove_backup_silently(self):
+        '''Remove the backup file if present. Used only when we created it
+        during this run but the run failed without modifying the PDF.'''
+        try:
+            if os.path.exists(self.backup_path):
+                os.remove(self.backup_path)
+        except OSError:
+            pass
+
+    def _show_post_write_dialog(self):
+        '''Modal dialog with Open PDF / Undo / Close.'''
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle('ToC embedded')
+        box.setText('Table of contents embedded successfully.')
+        open_btn = box.addButton('Open PDF', QMessageBox.ButtonRole.AcceptRole)
+        undo_btn = box.addButton('Undo', QMessageBox.ButtonRole.DestructiveRole)
+        close_btn = box.addButton('Close', QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(open_btn)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is open_btn:
+            self._open_pdf_externally()
+            # The post-write action is done; close the editor.
+            self.accept()
+        elif clicked is undo_btn:
+            self._undo_write()
+            # Stay in the editor so the user can adjust and retry.
+        else:
+            self.accept()
+
+    def _undo_write(self):
+        '''Restore the original PDF from the .original_pdf backup, then
+        return to the editor. The backup file is preserved -- it always
+        represents the truly-original PDF and is never modified after its
+        initial creation.'''
+        if not os.path.isfile(self.backup_path):
+            return error_dialog(
+                self, "Couldn't undo",
+                'The original PDF backup is missing. Nothing to restore.',
+                show=True)
+        try:
+            shutil.copyfile(self.backup_path, self.pdf_path)
+        except OSError as e:
+            return error_dialog(self, "Couldn't restore original", str(e), show=True)
+
+    def _open_pdf_externally(self):
+        '''Open the PDF with the OS default application.'''
+        try:
+            if sys.platform == 'darwin':
+                subprocess.Popen(['open', self.pdf_path])
+            elif sys.platform.startswith('win'):
+                os.startfile(self.pdf_path)  # noqa: SIM115
+            else:
+                subprocess.Popen(['xdg-open', self.pdf_path])
+        except Exception as e:
+            error_dialog(self, "Couldn't open PDF",
+                         f'Failed to launch the default PDF viewer:\n{e}',
+                         show=True)
+
+    # ---- Misc ----
+
+    def _show_parse_error(self, err):
+        details = ''
+        if err.line_number is not None:
+            details = f'Line {err.line_number}: {err.line_text!r}'
+        error_dialog(self, "Couldn't parse TOC",
+                     str(err), det_msg=details, show=True)

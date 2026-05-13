@@ -22,7 +22,7 @@ from qt.core import (
     QAbstractItemView, QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
     QFrame, QHBoxLayout, QHeaderView, QIcon, QLabel, QMessageBox,
     QPlainTextEdit, QPushButton, QSpinBox, QTabWidget, Qt,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from calibre.gui2 import error_dialog, gprefs, info_dialog, question_dialog
@@ -197,6 +197,7 @@ class TocTree(QTreeWidget):
         header.setSectionResizeMode(self.COL_TITLE, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(self.COL_PAGE, QHeaderView.ResizeMode.Interactive)
         self.setColumnWidth(self.COL_PAGE, 80)
+        self.setIndentation(32)
         self.itemChanged.connect(lambda _: self.refresh_warnings())
 
     # ---- Warning helpers ----
@@ -687,11 +688,17 @@ class EmbedTocDialog(QDialog):
 
         toolbar.addStretch(1)
 
-        expand_btn = QPushButton('Expand all')
+        expand_btn = QToolButton()
+        expand_btn.setArrowType(Qt.ArrowType.DownArrow)
+        expand_btn.setFixedSize(28, 28)
+        expand_btn.setToolTip('Expand all')
         expand_btn.clicked.connect(lambda: self.toc_tree.expandAll())
         toolbar.addWidget(expand_btn)
 
-        collapse_btn = QPushButton('Collapse all')
+        collapse_btn = QToolButton()
+        collapse_btn.setArrowType(Qt.ArrowType.RightArrow)
+        collapse_btn.setFixedSize(28, 28)
+        collapse_btn.setToolTip('Collapse all')
         collapse_btn.clicked.connect(lambda: self.toc_tree.collapseAll())
         toolbar.addWidget(collapse_btn)
 

@@ -3,10 +3,16 @@
 Embed a navigable table of contents into PDF books in your Calibre library
 from a plain-text TOC.
 
+> [!CAUTION]
+> This is a vibe coded project.
+> I think it works as intended,
+> but there could be something that doesn't.
+> Don't use it if you want to protect your library!
+
 ## What it does
 
 - Operates on a single selected PDF book in your library.
-- Lets you write the TOC in a text editor or a table view (both are kept in
+- Lets you write the ToC in a text editor or a table view (both are kept in
   sync; the same data is shown two ways).
 - Supports page labels: roman numerals (`v`, `ix`), arabic, or anything else
   the PDF's `/PageLabels` defines.
@@ -23,9 +29,15 @@ from a plain-text TOC.
 - After a successful write, prompts you to open the PDF in your OS's default
   viewer.
 
-DjVu is not supported.
+The plugin adds the following files to each book's data folder:
 
-## TOC file format
+- `toc` — the plain-text TOC. Persistent; auto-loaded when you re-open the
+  plugin on the same book.
+- `<book>.original_pdf` — a copy of the original PDF, captured on the
+  first successful run and never overwritten. Undo always restores from
+  this file.
+
+## ToC format
 
 ```
 # offset: 3
@@ -42,36 +54,3 @@ Chapter 2 Methods 15
 - `# offset: N` (optional) applies a global integer offset at write time,
   only when every entry's page is a positive integer.
 
-## Files in the book's data folder
-
-- `toc` — the plain-text TOC. Persistent; auto-loaded when you re-open the
-  plugin on the same book.
-- `<book>.original_pdf` — a snapshot of the original PDF, captured on the
-  first successful run and never overwritten. Undo always restores from
-  this file.
-
-## Install
-
-From the plugin folder:
-
-```
-calibre-customize -b .
-```
-
-Then in Calibre, open Preferences → Toolbars & menus and add the
-**Embed ToC** action to whichever toolbar or menu you want. (The plugin
-does not place itself anywhere by default.)
-
-## Development loop
-
-```
-calibre-debug -s && calibre-customize -b /path/to/this/folder && calibre
-```
-
-Shuts down a running Calibre, re-installs the plugin, and relaunches.
-
-Tests for the parser and PDF writer (no Calibre dependency):
-
-```
-python test_plugin.py
-```

@@ -2,8 +2,9 @@
 Main dialog for Embed ToC.
 
 UI flow:
-    - Tabbed editor: Text tab (QPlainTextEdit) and Table tab (QTableWidget).
-    - Both views share an in-memory ParsedToc. Switching tabs serializes the
+    - Tabbed editor: Text tab (QPlainTextEdit), Table tab (QTableWidget),
+      and Tree tab (QTreeWidget).
+    - All views share an in-memory ParsedToc. Switching tabs serializes the
       currently active view into ParsedToc and re-populates the other.
     - If parsing fails when leaving a tab, the switch is blocked and the
       user sees an inline error.
@@ -19,9 +20,10 @@ import subprocess
 import sys
 
 from qt.core import (
-    QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QHeaderView,
-    QIcon, QLabel, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox,
-    QTableWidget, QTableWidgetItem, QTabWidget, Qt, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
+    QHBoxLayout, QHeaderView, QIcon, QLabel, QMessageBox, QPlainTextEdit,
+    QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, Qt,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from calibre.gui2 import error_dialog, gprefs, info_dialog, question_dialog
@@ -325,6 +327,149 @@ class TocTable(QTableWidget):
         return out
 
 
+# ---------- Tree widget ----------
+
+class TocTree(QTreeWidget):
+    '''Two columns: Title and Page. Level is implicit from tree depth.
+    Supports drag-and-drop reordering and re-parenting (InternalMove).'''
+
+    COL_TITLE = 0
+    COL_PAGE = 1
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setColumnCount(2)
+        self.setHeaderLabels(['Title', 'Page'])
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setDropIndicatorShown(True)
+        self.setRootIsDecorated(True)
+        header = self.header()
+        header.setSectionResizeMode(self.COL_TITLE, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.COL_PAGE, QHeaderView.ResizeMode.Interactive)
+        self.setColumnWidth(self.COL_PAGE, 80)
+
+    def _make_item(self, title, page):
+        item = QTreeWidgetItem([title, page])
+        item.setFlags(
+            Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsSelectable
+            | Qt.ItemFlag.ItemIsEditable
+            | Qt.ItemFlag.ItemIsDragEnabled
+            | Qt.ItemFlag.ItemIsDropEnabled
+        )
+        return item
+
+    def load(self, entries):
+        self.clear()
+        if not entries:
+            return
+        # Stack-based reconstruction: stack holds (level, item) pairs.
+        stack = []
+        for entry in entries:
+            item = self._make_item(entry.title, entry.page)
+            while stack and stack[-1][0] >= entry.level:
+                stack.pop()
+            if stack:
+                stack[-1][1].addChild(item)
+            else:
+                self.addTopLevelItem(item)
+            stack.append((entry.level, item))
+        self.expandAll()
+
+    def add_entry(self):
+        '''Insert a blank sibling after the current item, or a top-level
+        item if nothing is selected.'''
+        current = self.currentItem()
+        item = self._make_item('', '')
+        if current:
+            parent = current.parent()
+            if parent:
+                idx = parent.indexOfChild(current)
+                parent.insertChild(idx + 1, item)
+            else:
+                idx = self.indexOfTopLevelItem(current)
+                self.insertTopLevelItem(idx + 1, item)
+        else:
+            self.addTopLevelItem(item)
+        self.setCurrentItem(item)
+        self.editItem(item, self.COL_TITLE)
+
+    def delete_selected(self):
+        item = self.currentItem()
+        if not item:
+            return
+        parent = item.parent()
+        if parent:
+            parent.removeChild(item)
+        else:
+            self.takeTopLevelItem(self.indexOfTopLevelItem(item))
+
+    def indent_selected(self):
+        '''Make the selected item a child of its preceding sibling.'''
+        item = self.currentItem()
+        if not item:
+            return
+        parent = item.parent()
+        if parent:
+            idx = parent.indexOfChild(item)
+            if idx == 0:
+                return
+            new_parent = parent.child(idx - 1)
+            parent.removeChild(item)
+            new_parent.addChild(item)
+            new_parent.setExpanded(True)
+        else:
+            idx = self.indexOfTopLevelItem(item)
+            if idx == 0:
+                return
+            new_parent = self.topLevelItem(idx - 1)
+            self.takeTopLevelItem(idx)
+            new_parent.addChild(item)
+            new_parent.setExpanded(True)
+        self.setCurrentItem(item)
+
+    def dedent_selected(self):
+        '''Move the selected item up one level, placing it after its parent.'''
+        item = self.currentItem()
+        if not item:
+            return
+        parent = item.parent()
+        if not parent:
+            return
+        grandparent = parent.parent()
+        if grandparent:
+            idx = grandparent.indexOfChild(parent)
+            parent.removeChild(item)
+            grandparent.insertChild(idx + 1, item)
+        else:
+            idx = self.indexOfTopLevelItem(parent)
+            parent.removeChild(item)
+            self.insertTopLevelItem(idx + 1, item)
+        self.setCurrentItem(item)
+
+    def dump_entries(self):
+        '''Walk tree and return a flat list of TocEntry. Raises TocParseError
+        if any item is missing a title or page.'''
+        out = []
+        for i in range(self.topLevelItemCount()):
+            self._collect(self.topLevelItem(i), 0, out)
+        return out
+
+    def _collect(self, item, level, out):
+        title = item.text(self.COL_TITLE).strip()
+        page = item.text(self.COL_PAGE).strip()
+        if title or page:
+            if not title:
+                raise TocParseError(f'An entry has a page ({page!r}) but no title.')
+            if not page:
+                raise TocParseError(f'Entry {title!r} has no page.')
+            out.append(TocEntry(title=title, page=page, level=level))
+        for i in range(item.childCount()):
+            self._collect(item.child(i), level + 1, out)
+
+
 # ---------- PDF health-check dialog ----------
 
 class _PdfHealthDialog(QDialog):
@@ -419,6 +564,7 @@ class EmbedTocDialog(QDialog):
 
     TAB_TEXT = 0
     TAB_TABLE = 1
+    TAB_TREE = 2
 
     def __init__(self, parent, pdf_path, book_title='Untitled'):
         super().__init__(parent)
@@ -508,6 +654,9 @@ class EmbedTocDialog(QDialog):
         # Table tab
         self.tabs.addTab(self._wrap_table_tab(), 'Table')
 
+        # Tree tab
+        self.tabs.addTab(self._wrap_tree_tab(), 'Tree')
+
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
         # --- Bottom button bar ---
@@ -570,6 +719,46 @@ class EmbedTocDialog(QDialog):
         # mutates icons (which doesn't fire itemChanged, but be safe).
         self.table.itemChanged.connect(lambda _: self.table.refresh_level_warnings())
         v.addWidget(self.table, 1)
+        return w
+
+    def _wrap_tree_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+
+        toolbar = QHBoxLayout()
+        add_btn = QPushButton('Add entry')
+        add_btn.clicked.connect(lambda: self.toc_tree.add_entry())
+        toolbar.addWidget(add_btn)
+
+        del_btn = QPushButton('Delete selected')
+        del_btn.clicked.connect(lambda: self.toc_tree.delete_selected())
+        toolbar.addWidget(del_btn)
+
+        indent_btn = QPushButton('Indent →')
+        indent_btn.setToolTip('Make the selected item a child of the item above it')
+        indent_btn.clicked.connect(lambda: self.toc_tree.indent_selected())
+        toolbar.addWidget(indent_btn)
+
+        dedent_btn = QPushButton('← Dedent')
+        dedent_btn.setToolTip('Move the selected item one level up')
+        dedent_btn.clicked.connect(lambda: self.toc_tree.dedent_selected())
+        toolbar.addWidget(dedent_btn)
+
+        toolbar.addStretch(1)
+
+        expand_btn = QPushButton('Expand all')
+        expand_btn.clicked.connect(lambda: self.toc_tree.expandAll())
+        toolbar.addWidget(expand_btn)
+
+        collapse_btn = QPushButton('Collapse all')
+        collapse_btn.clicked.connect(lambda: self.toc_tree.collapseAll())
+        toolbar.addWidget(collapse_btn)
+
+        v.addLayout(toolbar)
+
+        self.toc_tree = TocTree()
+        v.addWidget(self.toc_tree, 1)
         return w
 
     # ---- TOC load/save ----
@@ -637,8 +826,10 @@ class EmbedTocDialog(QDialog):
         try:
             if leaving == self.TAB_TEXT:
                 toc = self._toc_from_text()
-            else:
+            elif leaving == self.TAB_TABLE:
                 toc = self._toc_from_table()
+            else:
+                toc = self._toc_from_tree()
         except TocParseError as e:
             # Block the switch and revert.
             self._suppress_tab_handler = True
@@ -650,8 +841,10 @@ class EmbedTocDialog(QDialog):
         # Push into the now-current side.
         if new_index == self.TAB_TEXT:
             self.text_edit.setPlainText(serialize_toc(toc))
-        else:
+        elif new_index == self.TAB_TABLE:
             self.table.load(toc.entries)
+        else:
+            self.toc_tree.load(toc.entries)
 
         self.offset_spin.setValue(toc.offset)
         self._update_offset_state(toc)
@@ -666,12 +859,18 @@ class EmbedTocDialog(QDialog):
         entries = self.table.dump_entries()
         return ParsedToc(entries=entries, offset=self.offset_spin.value())
 
+    def _toc_from_tree(self):
+        entries = self.toc_tree.dump_entries()
+        return ParsedToc(entries=entries, offset=self.offset_spin.value())
+
     def _current_toc(self):
         '''Pull the current TOC from whichever tab is active. Raises
         TocParseError on parse failure.'''
         if self._current_tab == self.TAB_TEXT:
             return self._toc_from_text()
-        return self._toc_from_table()
+        elif self._current_tab == self.TAB_TABLE:
+            return self._toc_from_table()
+        return self._toc_from_tree()
 
     def _update_offset_state(self, toc):
         '''Enable the offset spinbox iff all entries have positive integer
@@ -762,6 +961,8 @@ class EmbedTocDialog(QDialog):
             self._update_offset_state(toc)
             if self._current_tab == self.TAB_TABLE:
                 self.table.load(toc.entries)
+            elif self._current_tab == self.TAB_TREE:
+                self.toc_tree.load(toc.entries)
         except TocParseError as e:
             self._show_parse_error(e)
 

@@ -1,5 +1,3 @@
-# Embed ToC — a Calibre plugin
-
 Embed a navigable table of contents into PDF books in your Calibre library
 from a plain-text TOC.
 

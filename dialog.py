@@ -24,7 +24,7 @@ from qt.core import (
     QTableWidget, QTableWidgetItem, QTabWidget, Qt, QVBoxLayout, QWidget,
 )
 
-from calibre.gui2 import error_dialog, info_dialog, question_dialog
+from calibre.gui2 import error_dialog, gprefs, info_dialog, question_dialog
 
 from calibre_plugins.toc_bookmarker.bookmarker.common import (
     ParsedToc, TocEntry, TocParseError,
@@ -450,6 +450,28 @@ class EmbedTocDialog(QDialog):
 
         self._build_ui()
         self._load_initial_toc()
+        self._restore_geometry()
+
+    # ---- Geometry persistence ----
+
+    def _restore_geometry(self):
+        geom = gprefs.get('embed_pdf_toc_dialog_geometry')
+        if geom:
+            self.restoreGeometry(bytes(geom))
+        col_widths = gprefs.get('embed_pdf_toc_table_col_widths')
+        if col_widths and len(col_widths) == 3:
+            for col, width in enumerate(col_widths):
+                self.table.setColumnWidth(col, width)
+
+    def _save_geometry(self):
+        gprefs['embed_pdf_toc_dialog_geometry'] = bytearray(self.saveGeometry())
+        gprefs['embed_pdf_toc_table_col_widths'] = [
+            self.table.columnWidth(col) for col in range(3)
+        ]
+
+    def closeEvent(self, event):
+        self._save_geometry()
+        super().closeEvent(event)
 
     # ---- UI construction ----
 

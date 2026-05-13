@@ -6,7 +6,7 @@ class EmbedToc(InterfaceActionBase):
     Wrapper class for the Embed ToC plugin. Lives in __init__.py and
     MUST NOT import any GUI libraries here. The real plugin is in ui.py.
     '''
-    name                    = 'Embed ToC'
+    name                    = 'Embed PDF ToC'
     description             = ('Embed a navigable table of contents into PDF '
                                'books in your library from a plain-text TOC.')
     supported_platforms     = ['windows', 'osx', 'linux']

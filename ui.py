@@ -14,11 +14,11 @@ from calibre.gui2.actions import InterfaceAction
 
 class EmbedTocAction(InterfaceAction):
 
-    name = 'Embed ToC'
+    name = 'Embed PDF ToC'
 
     # (display name, icon path or None, status tip, keyboard shortcut)
     # Keyboard shortcut left as None -- user can set one if they want.
-    action_spec = ('Embed ToC', None,
+    action_spec = ('Embed PDF ToC', None,
                    'Embed a navigable table of contents into the selected PDF', None)
 
     # The action targets the currently selected book(s) in the library.
@@ -33,7 +33,7 @@ class EmbedTocAction(InterfaceAction):
     def genesis(self):
         # Try to load a custom icon; fall back to a builtin so the action
         # is never icon-less.
-        icon = get_icons('images/icon.png', 'Embed ToC')  # noqa: F821
+        icon = get_icons('images/icon.png', 'Embed PDF ToC')  # noqa: F821
         if icon and not icon.isNull():
             self.qaction.setIcon(icon)
         self.qaction.triggered.connect(self.run_bookmarker)
